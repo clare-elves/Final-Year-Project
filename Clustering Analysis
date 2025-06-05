@@ -1,0 +1,269 @@
+# first, determine eps (distance cutoff) by plotting k-distance plotting using minimum Ca-Ca distances
+
+import mdtraj as md
+import numpy as np
+import matplotlib.pyplot as plt
+from openmm.app import PDBFile
+
+# === CONFIGURATION ===
+topology_path = "experiment_1_YY1_1-100/100_2000x2000x2000.pdb"
+trajectory_path = "experiment_1_YY1_1-100/system.dcd"
+frame_index = 150
+residues_per_chain = 102
+k = 1  # nearest neighbor
+derivative_threshold = 1.0  # nm — adjust if needed, used 1.0 for 1-270/101-270 and 0.05 for 1-100
+
+# === LOAD TOPOLOGY AND TRAJECTORY ===
+pdb = PDBFile(topology_path)
+top = md.Topology.from_openmm(pdb.topology)
+traj = md.load_dcd(trajectory_path, top=top)
+frame = traj[frame_index]
+
+# === GROUP Cα ATOMS BY CHAIN ===
+residues = list(traj.topology.residues)
+ca_indices_per_chain = []
+for i in range(0, len(residues), residues_per_chain):
+    block = residues[i:i + residues_per_chain]
+    ca_indices = [atom.index for res in block for atom in res.atoms if atom.name == "CA"]
+    ca_indices_per_chain.append(ca_indices)
+
+# === COMPUTE PAIRWISE MINIMUM Cα–Cα DISTANCES BETWEEN CHAINS ===
+n_chains = len(ca_indices_per_chain)
+min_distances = np.full((n_chains, n_chains), np.inf)
+
+for i in range(n_chains):
+    coords_i = frame.xyz[0, ca_indices_per_chain[i], :]
+    for j in range(i + 1, n_chains):
+        coords_j = frame.xyz[0, ca_indices_per_chain[j], :]
+        dists = np.linalg.norm(coords_i[:, None, :] - coords_j[None, :, :], axis=-1)
+        min_dist = np.min(dists)
+        min_distances[i, j] = min_dist
+        min_distances[j, i] = min_dist
+
+# === EXTRACT K-DISTANCES ===
+k_distances = np.sort([np.sort(row)[k + 1] for row in min_distances])  # +1 to skip self
+
+# === FIRST DERIVATIVE (DIFFERENCES) ===
+delta_distances = np.diff(k_distances)
+first_jump_index = np.argmax(delta_distances > derivative_threshold)
+eps = k_distances[first_jump_index] if delta_distances[first_jump_index] > derivative_threshold else None
+
+# === PLOT ===
+plt.figure(figsize=(8, 5))
+plt.plot(k_distances, marker='o', linestyle='-', label='k-distance')
+
+if eps is not None:
+    plt.axvline(first_jump_index, color='red', linestyle='--', label=f"ε ≈ {eps:.2f} nm")
+    plt.plot(first_jump_index, eps, 'ro')
+
+plt.xlabel("Chain index (sorted)")
+plt.ylabel(f"{k}-th Nearest Neighbor Distance (nm)")
+plt.title("k-distance Plot (Min Cα–Cα) for DBSCAN eps Selection")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+#plt.savefig("plots/dbscan_k_distance_1-100.png", dpi=300)
+plt.show()
+
+if eps is not None:
+    print(f"✅ Suggested eps from elbow detection: {eps:.3f} nm")
+else:
+    print("⚠️ No elbow detected — try lowering derivative_threshold.")
+
+#computing clusters
+
+import mdtraj as md
+import numpy as np
+import matplotlib.pyplot as plt
+from openmm.app import PDBFile
+from sklearn.cluster import DBSCAN
+from scipy.spatial.distance import cdist
+import os
+
+# === CONFIGURATION ===
+topology_path = "experiment_1_YY1_1-100/100_2000x2000x2000.pdb"
+trajectory_path = "experiment_1_YY1_1-100/system.dcd"
+output_dir = "experiment_1_YY1_1-100"
+residues_per_chain = 102
+eps = 0.6  # distance cutoff in nm for DBSCAN, used 0.9 for 101-270, 0.6 for 1-100 (heuristic estimation), 1.8 for 1-270
+min_samples = 3
+
+# === LOAD TOPOLOGY & TRAJECTORY ===
+pdb = PDBFile(topology_path)
+top = md.Topology.from_openmm(pdb.topology)
+traj = md.load_dcd(trajectory_path, top=top)
+
+# === CHAIN GROUPING BASED ON RESIDUE BLOCKING ===
+residues = list(traj.topology.residues)
+ca_indices_per_chain = []
+for i in range(0, len(residues), residues_per_chain):
+    block = residues[i:i + residues_per_chain]
+    ca_indices = [atom.index for res in block for atom in res.atoms if atom.name == "CA"]
+    ca_indices_per_chain.append(ca_indices)
+
+# === DBSCAN CLUSTERING ===
+cluster_counts = []
+avg_cluster_sizes = []
+max_cluster_sizes = []
+
+for i, frame in enumerate(traj):
+    n_chains = len(ca_indices_per_chain)
+    min_distances = np.full((n_chains, n_chains), np.inf)
+
+    for a in range(n_chains):
+        coords_a = frame.xyz[0, ca_indices_per_chain[a], :]
+        for b in range(a + 1, n_chains):
+            coords_b = frame.xyz[0, ca_indices_per_chain[b], :]
+            min_dist = np.min(cdist(coords_a, coords_b))
+            min_distances[a, b] = min_dist
+            min_distances[b, a] = min_dist
+
+    np.fill_diagonal(min_distances, 0.0)
+    
+    clustering = DBSCAN(eps=eps, min_samples=min_samples, metric='precomputed')
+    labels = clustering.fit_predict(min_distances)
+
+    valid_labels = labels[labels != -1]
+    n_clusters = len(set(valid_labels))
+    cluster_counts.append(n_clusters)
+
+    if n_clusters > 0:
+        sizes = [np.sum(valid_labels == label) for label in set(valid_labels)]
+        avg_cluster_sizes.append(np.mean(sizes))
+        max_cluster_sizes.append(np.max(sizes))
+    else:
+        avg_cluster_sizes.append(0)
+        max_cluster_sizes.append(0)
+
+    if i % 50 == 0:
+        print(f"Frame {i}/{traj.n_frames}: clusters = {n_clusters}, avg size = {avg_cluster_sizes[-1]:.2f}, max size = {max_cluster_sizes[-1]}")
+
+# === SAVE OUTPUT ===
+np.save(f"{output_dir}/cluster_counts_dbscan_v2.npy", np.array(cluster_counts))
+np.save(f"{output_dir}/avg_cluster_sizes_dbscan_v2.npy", np.array(avg_cluster_sizes))
+np.save(f"{output_dir}/max_cluster_sizes_dbscan_v2.npy", np.array(max_cluster_sizes))
+
+# plotting cluster count over time for all constructs
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# === CONFIGURATION ===
+window =20
+
+constructs = {
+    "1–100": {
+        "path": "experiment_1_YY1_1-100/cluster_counts_dbscan_v2.npy",
+        "frame_interval_us": 0.0025 * 5000 / 1000,  # adjust based on actual stride × timestep
+        "clip_time_us": 11.5  # Clip this construct at 11.5 µs
+    },
+    "1–270": {
+        "path": "experiment_2_YY1_1-270/cluster_counts_dbscan_v2.npy",
+        "frame_interval_us": 0.0025 * 5000 / 1000  
+    },
+    "101–270": {
+        "path": "experiment_3_YY1_101-270/cluster_counts_dbscan_v2.npy",
+        "frame_interval_us": 0.0035 * 5000 / 1000,  
+        "clip_time_us": 11.5  # Clip this construct at 11.5 µs
+    }
+}
+
+# === MOVING AVERAGE FUNCTION === to smoothen
+def moving_average(data, window=5):
+    return np.convolve(data, np.ones(window)/window, mode='valid')
+
+# === PLOT ===
+plt.figure(figsize=(7, 5))
+
+for label, info in constructs.items():
+    data = np.load(info["path"])
+    time_axis = np.arange(len(data)) * info["frame_interval_us"]
+    
+    # Clip if specified
+    if "clip_time_us" in info:
+        max_index = np.searchsorted(time_axis, info["clip_time_us"])
+        data = data[:max_index]
+        time_axis = time_axis[:max_index]
+
+    # Smooth data
+    smoothed_data = moving_average(data, window)
+    smoothed_time = time_axis[:len(smoothed_data)]
+
+    plt.plot(smoothed_time, smoothed_data, label=f"Construct {label}")
+
+
+plt.xlabel("Time (µs)", fontsize=14, fontweight='bold')
+plt.ylabel("Number of Clusters", fontsize=14, fontweight='bold')
+plt.xticks(fontsize=12)  # X-axis tick numbers
+plt.yticks(fontsize=12)  # Y-axis tick numbers
+#plt.title("Cluster Count Over Time for Different Constructs")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.savefig("plots/cluster_count_multiple_constructs_new.png", dpi=300)
+plt.show()
+
+
+# plotting cluster size ONLY over time for all constructs
+
+# plotting average cluster size over time for all constructs with smoothing and clipping
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# === CONFIGURATION ===
+window = 20  # smoothing window
+
+constructs = {
+    "1–100": {
+        "avg_path": "experiment_1_YY1_1-100/avg_cluster_sizes_dbscan_v2.npy",
+        "frame_interval_us": 0.0025 * 5000 / 1000,
+        "clip_time_us": 11.5
+    },
+    "1–270": {
+        "avg_path": "experiment_2_YY1_1-270/avg_cluster_sizes_dbscan_v2.npy",
+        "frame_interval_us": 0.0025 * 5000 / 1000
+    },
+    "101–270": {
+        "avg_path": "experiment_3_YY1_101-270/avg_cluster_sizes_dbscan_v2.npy",
+        "frame_interval_us": 0.0035 * 5000 / 1000,
+        "clip_time_us": 11.5
+    }
+}
+
+# === MOVING AVERAGE FUNCTION ===
+def moving_average(data, window):
+    return np.convolve(data, np.ones(window)/window, mode='valid')
+
+# === PLOT ===
+plt.figure(figsize=(7, 5))
+
+for label, info in constructs.items():
+    avg = np.load(info["avg_path"])
+    time_axis = np.arange(len(avg)) * info["frame_interval_us"]
+
+    # Clip if requested
+    if "clip_time_us" in info:
+        max_index = int(info["clip_time_us"] / info["frame_interval_us"])
+        avg = avg[:max_index]
+        time_axis = time_axis[:max_index]
+
+    # Smooth
+    avg_smooth = moving_average(avg, window)
+    time_smooth = time_axis[:len(avg_smooth)]
+
+    # Plot
+    #plt.plot(time_smooth, avg_smooth, label=f"{label}")
+    plt.plot(time_smooth, avg_smooth, label=f"Construct {label}")
+
+
+plt.xlabel("Time (µs)",fontsize=14, fontweight='bold')
+plt.ylabel("Average Cluster Size", fontsize=14, fontweight='bold')
+plt.xticks(fontsize=12)  # X-axis tick numbers
+plt.yticks(fontsize=12)  # Y-axis tick numbers
+#plt.title("Average Cluster Size Over Time for Different Constructs")
+plt.legend()
+plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+plt.tight_layout()
+plt.savefig("plots/cluster_size_multiple_constructs_new.png", dpi=300)
+plt.show()
