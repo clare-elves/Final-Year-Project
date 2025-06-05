@@ -1,0 +1,219 @@
+#This will initialise the packages for this notebook
+import MDAnalysis as mda
+import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
+import pandas as pd
+
+#Use this codeblock to initialise your trajectory and topology files
+
+Topology_file = 'experiment_3_YY1_101-270/100_2000x2000x2000.pdb' #PUT YOUR TOPOLOGY FILE HERE
+Trajectory_file = 'experiment_3_YY1_101-270/system.dcd' #PUT YOUR TRAJECTORY FILE HERE
+
+
+
+Number_of_proteins = 100
+
+u = mda.Universe(Topology_file, Trajectory_file)
+
+from tqdm import tqdm
+import MDAnalysis as mda
+from sklearn.cluster import DBSCAN
+import numpy as np
+import mdtraj as md
+import matplotlib.pyplot as plt
+from collections import Counter
+
+# ---- Load universe and select protein ----
+ # Replace with your actual file names
+protein = u.select_atoms("protein")
+
+n_proteins = 100
+residues_per_protein = 170
+eps = 9 # in angstroms
+min_samples = 3
+
+# Group residues into per-protein groups
+protein_groups = [
+    protein.residues[i:i + residues_per_protein]
+    for i in range(0, len(protein.residues), residues_per_protein)
+]
+
+def get_protein_COMs(groups):
+    return np.array([g.center_of_mass() for g in groups])
+
+# ---- Set up structure counters ----
+position_structures_condensed = [Counter() for _ in range(residues_per_protein)]
+position_counts_condensed = np.zeros(residues_per_protein)
+
+position_structures_dilute = [Counter() for _ in range(residues_per_protein)]
+position_counts_dilute = np.zeros(residues_per_protein)
+
+residue_names = ["UNK"] * residues_per_protein
+
+helix_codes = {'H', 'G', 'I'}
+beta_codes = {'E', 'B'}
+intra_codes = {'B'}
+extra_codes = {'E'}
+
+# ---- Process trajectory ----
+for ts in tqdm(u.trajectory, desc="Processing frames"):
+    coms = get_protein_COMs(protein_groups)
+    clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(coms)
+    labels = clustering.labels_
+
+    valid_labels = labels[labels != -1]
+    if len(valid_labels) == 0:
+        continue
+
+    largest_label = np.bincount(valid_labels).argmax()
+    clustered_indices = [i for i, label in enumerate(labels) if label == largest_label]
+    dilute_indices = [i for i, label in enumerate(labels) if label == -1]
+
+    for is_condensed, indices in [(True, clustered_indices), (False, dilute_indices)]:
+        for i in indices:
+            protein_residues = protein_groups[i]
+            atoms = protein_residues.atoms
+            sub_u = mda.Merge(atoms)
+            sub_u.atoms.positions = atoms.positions.copy()
+            sub_u.atoms.write("temp_protein.pdb")
+
+            traj = md.load("temp_protein.pdb")
+            ss = md.compute_dssp(traj, simplified=False)[0]
+
+            for j, (res, sstruct) in enumerate(zip(traj.topology.residues, ss)):
+                if j >= residues_per_protein:
+                    continue
+
+                if is_condensed:
+                    position_structures_condensed[j][sstruct] += 1
+                    position_counts_condensed[j] += 1
+                else:
+                    position_structures_dilute[j][sstruct] += 1
+                    position_counts_dilute[j] += 1
+
+                residue_names[j] = res.name
+
+# ---- Compute probability distributions for condensed peptides ----
+fraction_with_beta = []
+fraction_with_bridge = []
+fraction_with_sheet = []
+
+for ts in tqdm(u.trajectory, desc="Re-scanning condensed phase"):
+    coms = get_protein_COMs(protein_groups)
+    clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(coms)
+    labels = clustering.labels_
+
+    valid_labels = labels[labels != -1]
+    if len(valid_labels) == 0:
+        continue
+
+    largest_label = np.bincount(valid_labels).argmax()
+    clustered_indices = [i for i, label in enumerate(labels) if label == largest_label]
+    if not clustered_indices:
+        continue
+
+    has_beta, has_bridge, has_sheet = [], [], []
+
+    for i in clustered_indices:
+        protein_residues = protein_groups[i]
+        atoms = protein_residues.atoms
+        sub_u = mda.Merge(atoms)
+        sub_u.atoms.positions = atoms.positions.copy()
+        sub_u.atoms.write("temp_protein.pdb")
+
+        traj = md.load("temp_protein.pdb")
+        ss = md.compute_dssp(traj, simplified=False)[0]
+
+        has_b = any(s in beta_codes for s in ss)
+        has_bbridge = 'B' in ss
+        has_bsheet = 'E' in ss
+
+        has_beta.append(has_b)
+        has_bridge.append(has_bbridge)
+        has_sheet.append(has_bsheet)
+
+    n = len(clustered_indices)
+    if n > 0:
+        fraction_with_beta.append(sum(has_beta) / n)
+        fraction_with_bridge.append(sum(has_bridge) / n)
+        fraction_with_sheet.append(sum(has_sheet) / n)
+
+# ---- Compute helix and beta frequencies ----
+helix_freq_condensed, beta_freq_condensed, intra_condens, extra_condens = [], [], [], []
+helix_freq_dilute, beta_freq_dilute, extra_dil  = [], [], []
+
+x_labels = []
+
+for i in range(residues_per_protein):
+    # Condensed
+    total_c = position_counts_condensed[i]
+    counts_c = position_structures_condensed[i]
+    helix_c = sum(counts_c[c] for c in helix_codes)
+    beta_c = sum(counts_c[c] for c in beta_codes)
+    intra_c = sum(counts_c[c] for c in intra_codes)
+    extra_c = sum(counts_c[c] for c in extra_codes)
+    helix_freq_condensed.append(helix_c / total_c if total_c > 0 else 0)
+    beta_freq_condensed.append(beta_c / total_c if total_c > 0 else 0)
+    intra_condens.append(intra_c / total_c if total_c > 0 else 0)
+    extra_condens.append(extra_c / total_c if total_c > 0 else 0)
+
+    # Dilute
+    total_d = position_counts_dilute[i]
+    counts_d = position_structures_dilute[i]
+    helix_d = sum(counts_d[c] for c in helix_codes)
+    beta_d = sum(counts_d[c] for c in beta_codes)
+    extra_d = sum(counts_d[c] for c in extra_codes)
+    helix_freq_dilute.append(helix_d / total_d if total_d > 0 else 0)
+    beta_freq_dilute.append(beta_d / total_d if total_d > 0 else 0)
+    extra_dil.append(extra_d /total_d if total_d > 0 else 0)
+
+    x_labels.append(f"{i+1}-{residue_names[i]}")
+
+plt.figure(figsize=(14, 5))
+
+plt.plot(x_labels, helix_freq_condensed, label="Helix (Condensed)", color='mediumseagreen')
+plt.plot(x_labels, helix_freq_dilute, label="Helix (Dilute)", color='black')
+
+plt.ylabel('Helicity', fontsize=14, fontweight='bold')
+plt.xlabel('Residue Index', fontsize=14, fontweight='bold')
+plt.ylim(0, 0.25)
+plt.yticks(np.arange(0, 0.35, 0.05), fontsize=12)
+
+# Show only every 10th residue number on x-axis
+tick_spacing = 10
+tick_positions = list(range(0, len(x_labels), tick_spacing))
+tick_labels = [str(i + 1) for i in tick_positions]  # 1-based residue index
+
+plt.xticks(ticks=tick_positions, labels=tick_labels, fontsize=12, rotation=0)
+
+# Optional visual enhancements
+# plt.axvspan(21, 50, color='orange', alpha=0.1, label='WW1 Domain')
+# plt.axvspan(80, 113, color='red', alpha=0.1, label='WW2 Domain')
+plt.tick_params(axis='x', direction='in')
+plt.tick_params(axis='y', direction='in')
+plt.legend()
+#plt.savefig("plots/hughie_dilute_vs_condensed_helicity_1-270.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+plt.figure(figsize=(14, 5))
+
+plt.plot(x_labels, beta_freq_condensed, label="Beta (Condensed)", color='mediumseagreen')
+plt.plot(x_labels, beta_freq_dilute, label="Beta (Dilute)", color='black')
+plt.xlabel('Residue Number', fontsize=14, fontweight='bold')
+plt.ylabel('Observed Beta Sheet Formation', fontsize=14, fontweight='bold')
+
+# Adjust for actual residue numbers (e.g., 101–270)
+residue_start = 1  # change if your starting residue number differs
+tick_spacing = 10
+tick_positions = list(range(0, len(x_labels), tick_spacing))
+tick_labels = [str(residue_start + i) for i in tick_positions]
+
+plt.xticks(ticks=tick_positions, labels=tick_labels, fontsize=12, rotation=0)
+
+plt.tick_params(axis='x', direction='in')
+plt.tick_params(axis='y', direction='in')
+plt.legend()
+
+plt.savefig("plots/hughie_dilute_vs_condensed_beta_101-270.png", dpi=300, bbox_inches="tight")
+plt.show()
