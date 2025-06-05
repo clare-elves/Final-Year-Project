@@ -1,0 +1,211 @@
+# Loading and analysing Rg/RMSD for single constructs
+## This block MUST be run before plotting anything for EACH construct you want to analyse.
+###Prepare CPPTRAJ input to calculate Rg for each monomer
+
+# Prepare output directory
+construct_label = "1_100" #change accordingly 
+output_dir = "experiment_1_YY1_1-100" #change according to where you want your output files to go
+os.makedirs(output_dir, exist_ok=True)
+
+# Set input files
+topology_file = "experiment_1_YY1_1-100/100_2000x2000x2000.pdb" #replace with your topology file name/path
+trajectory_file = "experiment_1_YY1_1-100/system.dcd" #replace with your trajectory file name/path
+residues_per_protein = 100 #change protein length accordingly
+num_proteins = 100
+start_offset = 1
+end_offset = 100 #change accordingly
+
+# Start CPPTRAJ input script
+cpptraj_input = f"parm {topology_file}\ntrajin {trajectory_file}\n"
+
+# Loop through all (100) proteins for this construct
+for i in range(num_proteins):
+    res_start = i * residues_per_protein + start_offset
+    res_end = i * residues_per_protein + end_offset
+    cpptraj_input += f"radgyr :{res_start}-{res_end} out {output_dir}/rg_{construct_label}_prot_{i+1}.dat\n"
+    cpptraj_input += f"rms first :{res_start}-{res_end}@CA out {output_dir}/rmsd_{construct_label}_prot_{i+1}.dat\n"
+
+# Save cpptraj input
+with open("calculate_rg_rmsd_1_100.in", "w") as f: #change range accordingly
+    f.write(cpptraj_input)
+
+# Run cpptraj (in notebook or terminal)
+import subprocess
+subprocess.run(["cpptraj", "-i", f"calculate_rg_rmsd_{construct_label}.in"], stdout=open(f"{output_dir}/cpptraj_{construct_label}.log", "w"))
+
+#Plotting the outputs
+## This block MUST be run before plotting anything.
+###ensure you have matplotlib, pandas and seaborn installed in your terminal, if not; eg. conda install seaborn
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import glob
+
+# Load Rg and RMSD .dat files
+rg_data = []
+rmsd_data = []
+
+for i in range(1, 101):
+    try:
+        rg = np.loadtxt(f"experiment_1_YY1_1-100/rg_1_100_prot_{i}.dat", skiprows=1, usecols=(0, 1)) #change rg.dat file name/path accordingly
+        for frame, value in rg:
+            rg_data.append({"Protein": i, "Frame": int(frame), "Rg": value})
+    except:
+        continue
+
+    try:
+        rmsd = np.loadtxt(f"experiment_1_YY1_1-100/rmsd_1_100_prot_{i}.dat", skiprows=1, usecols=(0, 1)) #change rmsd.dat file name/path accordingly
+        for frame, value in rmsd:
+            rmsd_data.append({"Protein": i, "Frame": int(frame), "RMSD": value})
+    except:
+        continue
+
+df_rg = pd.DataFrame(rg_data)
+print(df_rg.head()) #to check if your data frames are successfully loaded
+print(df_rg.columns)
+
+df_rmsd = pd.DataFrame(rmsd_data)
+print(df_rmsd.head()) #to check if your data frames are successfully loaded
+print(df_rmsd.columns)
+
+# Plot 1.2: Average Rg and RMSD over time - Multiple construct analysis
+### Enables easy comparison between constructs.
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import glob
+
+
+# === CONFIGURATION ===
+constructs = ["1_100", "1_270", "101_270"]
+frame_intervals = {
+    "1_100": 0.0025 * 5000 / 1000,
+    "1_270": 0.0025 * 5000 / 1000,
+    "101_270": 0.0035 * 5000 / 1000
+}
+folder_map = {
+    "1_100": "experiment_1_YY1_1-100/",
+    "1_270": "experiment_2_YY1_1-270/",
+    "101_270": "experiment_3_YY1_101-270/"
+}
+clip_time_limit = {
+    "101_270": 11.5,  # microseconds
+    "1_100": 11.5  # microseconds
+}
+smooth_window = 5  # Number of timepoints to use in moving average
+
+# setting colours
+
+# Pick a Seaborn palette with 3 distinct colors
+palette = sns.color_palette("muted", n_colors=3) # deep (default), muted, pastel, dark, bright
+
+# Assign colors to constructs in order
+color_map = dict(zip(constructs, palette))
+
+# === DATA LOADING ===
+rg_all, rmsd_all = [], []
+
+for construct in constructs:
+    frame_interval_us = frame_intervals[construct]
+    folder = folder_map[construct]
+    for i in range(1, 101):
+        try:
+            rg = np.loadtxt(f"{folder}/rg_{construct}_prot_{i}.dat", skiprows=1, usecols=(0, 1))
+            for frame, value in rg:
+                time_us = frame * frame_interval_us
+                if construct in clip_time_limit and time_us > clip_time_limit[construct]:
+                    continue
+                rg_all.append({
+                    "Construct": construct,
+                    "Protein": i,
+                    "Frame": int(frame),
+                    "Time (µs)": time_us,
+                    "Rg": value
+                })
+        except Exception as e:
+            print(f"Skipping rg_{construct}_prot_{i}.dat: {e}")
+            continue
+
+        try:
+            rmsd = np.loadtxt(f"{folder}/rmsd_{construct}_prot_{i}.dat", skiprows=1, usecols=(0, 1))
+            for frame, value in rmsd:
+                time_us = frame * frame_interval_us
+                if construct in clip_time_limit and time_us > clip_time_limit[construct]:
+                    continue
+                rmsd_all.append({
+                    "Construct": construct,
+                    "Protein": i,
+                    "Frame": int(frame),
+                    "Time (µs)": time_us,
+                    "RMSD": value
+                })
+        except Exception as e:
+            print(f"Skipping rmsd_{construct}_prot_{i}.dat: {e}")
+            continue
+
+df_rg = pd.DataFrame(rg_all)
+df_rmsd = pd.DataFrame(rmsd_all)
+
+# === PLOTTING: Smoothed Average Rg ===
+plt.figure(figsize=(7, 5))
+# Define how each construct should appear in the legend
+legend_labels = {
+    "1_100": "Construct 1–100",
+    "1_270": "Construct 1–270",
+    "101_270": "Construct 101–270"
+}
+
+for construct in constructs:
+    df = df_rg[df_rg["Construct"] == construct]
+    avg_rg = df.groupby("Time (µs)")["Rg"].mean().rolling(window=smooth_window, center=True).mean()
+    plt.plot(
+        avg_rg.index,
+        avg_rg.values,
+        label=legend_labels[construct],
+        color=color_map[construct]  # 🎨 from Seaborn
+    )
+plt.xlabel("Time (µs)", fontsize=14, fontweight='bold')
+plt.ylabel("Average Rg (Å)", fontsize=14, fontweight='bold')
+plt.xticks(fontsize=12)  # X-axis tick numbers
+plt.yticks(fontsize=12)  # Y-axis tick numbers
+#plt.title("Average Radius of Gyration Over Time")
+plt.legend(fontsize=12)
+plt.grid(True)
+plt.tight_layout()
+plt.savefig("plots/Rg_1.2_multiple_smoothed.png", dpi=300, bbox_inches="tight") #assuming presence of dedicated 'plot' folder.
+plt.show()
+
+# === PLOTTING: Smoothed Average RMSD ===
+plt.figure(figsize=(7, 5))
+
+# Define how each construct should appear in the legend
+legend_labels = {
+    "1_100": "Construct 1–100",
+    "1_270": "Construct 1–270",
+    "101_270": "Construct 101–270"
+}
+
+for construct in constructs:
+    df = df_rmsd[df_rmsd["Construct"] == construct]
+    avg_rmsd = df.groupby("Time (µs)")["RMSD"].mean().rolling(window=smooth_window, center=True).mean()
+    plt.plot(
+        avg_rmsd.index,
+        avg_rmsd.values,
+        label=legend_labels[construct],
+        color=color_map[construct]  # 🎨 from Seaborn
+    )
+plt.xlabel("Time (µs)", fontsize=14, fontweight='bold')
+plt.ylabel("Average RMSD (Å)", fontsize=14, fontweight='bold')
+plt.xticks(fontsize=12)  # X-axis tick numbers
+plt.yticks(fontsize=12)  # Y-axis tick numbers
+#plt.title("Average RMSD Over Time")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.savefig("plots/RMSD_1.2_multiple_smoothed.png", dpi=300, bbox_inches="tight") #assuming presence of dedicated 'plot' folder.
+plt.show()
+
