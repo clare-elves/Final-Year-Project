@@ -1,0 +1,302 @@
+# if you get a lengthy tqdm warning after running this block, it is safe to ignore it
+
+# Import necessary libraries
+
+import numpy as np
+import MDAnalysis as mda
+from MDAnalysis.lib.distances import distance_array
+import matplotlib.pyplot as plt
+import seaborn as sns
+from openmm.app import PDBFile # i used openmm to load my topology 
+import mdtraj as md # i used MDTraj for clustering
+
+
+# files and path parameters
+
+topology_file = 'experiment_2_YY1_1-270/100_2000x2000x2000.pdb'
+trajectory_file = 'experiment_2_YY1_1-270/system.dcd'
+residues_per_monomer = 270 # eg. use 170 instead of 172 since caps are already included downstream in analysis
+contact_threshold = 10  # in Ångströms, because MDAnalysis gives coordinates in Å
+num_monomers = 100
+num_frames_to_average = 100 # last X frames
+
+
+# openmm and mdtraj only for clustering
+
+pdb = PDBFile('experiment_2_YY1_1-270/100_2000x2000x2000.pdb')
+top = md.Topology.from_openmm(pdb.topology)
+traj = md.load_dcd('experiment_2_YY1_1-270/system.dcd', top=top)
+
+
+# mdanalysis for contact map analysis
+u = mda.Universe(topology_file, trajectory_file)
+n_frames = len(u.trajectory)
+
+
+# i added this code block to analyse contacts only between chains in condensates
+# specifically, this block aims to compute the MINIMUM CA PAIRWISE DISTANCES of each chain using atom indices, 
+# then constructs a pairwise distance matrix between all minimum Ca distances,
+# then builds a graph of chain connectivity: chains are connected if they are within the distance cutoff (in nm),
+# then find clusters of spatially close chains, selecting the largest droplet only,
+# then stores only the chain indices of that biggest component per frame.
+
+def get_condensate_chains_by_min_distance(traj, atom_indices_per_chain, distance_cutoff, atom_name="CA"):
+    import networkx as nx
+    from scipy.spatial.distance import cdist
+
+    # Precompute per-chain representative atom positions (e.g. CA only)
+    # Build a list of atom indices corresponding to the selected atom type per chain
+    ca_indices_per_chain = []
+    for atom_group in atom_indices_per_chain:
+        ca_indices = [i for i in atom_group if traj.topology.atom(i).name == atom_name]
+        ca_indices_per_chain.append(ca_indices)
+
+    condensate_chains_all_frames = []
+
+    for frame in traj:
+        centers = []
+
+        for ca_indices in ca_indices_per_chain:
+            coords = frame.xyz[0, ca_indices, :]
+            centers.append(coords)
+
+        G = nx.Graph()
+        for i in range(len(centers)):
+            for j in range(i + 1, len(centers)):
+                dists = cdist(centers[i], centers[j])  # shape (residues_i, residues_j)
+                min_dist = np.min(dists)
+                if min_dist < distance_cutoff:
+                    G.add_edge(i, j)
+
+        components = list(nx.connected_components(G))
+        if components:
+            largest_cluster = max(components, key=len)
+            condensate_chains_all_frames.append(sorted(list(largest_cluster)))
+        else:
+            condensate_chains_all_frames.append([])
+
+    return condensate_chains_all_frames
+
+residues = list(traj.topology.residues)
+atom_indices_per_chain = []
+
+for i in range(0, len(residues), residues_per_monomer + 2):  # or 172 if including caps
+    block = residues[i:i + residues_per_monomer + 2]
+    atom_indices = [atom.index for res in block for atom in res.atoms]
+    atom_indices_per_chain.append(atom_indices)
+
+# then, call
+condensate_chain_lists = get_condensate_chains_by_min_distance(
+    traj, atom_indices_per_chain, distance_cutoff=1.8  # in nm, adjust accordingly
+)
+condensate_chain_lists = condensate_chain_lists[-num_frames_to_average:]
+
+
+print("Condensate chain detection complete. Chains in the largest cluster per frame have been stored.")
+
+# creating a list containing coordinates of each Ca for all 100 monomers
+
+def get_monomer_ca_positions(universe, residues_per_monomer):
+    monomer_ca_coords = []
+
+    for i in range(num_monomers):
+        start_residue = i * (residues_per_monomer + 2) + 1  # include caps
+        end_residue = (i + 1) * (residues_per_monomer + 2) - 1
+        residues = universe.residues[start_residue: end_residue]
+
+        ca_coords = []
+        for residue in residues:
+            ca_atoms = residue.atoms.select_atoms("name CA")
+            if len(ca_atoms) == 1:
+                ca_coords.append(ca_atoms.positions[0])
+            else:
+                ca_coords.append(np.array([np.nan, np.nan, np.nan]))
+
+        monomer_ca_coords.append(ca_coords)
+
+    print("Monomer CA coordinate extraction complete.")
+    return np.array(monomer_ca_coords)  # shape: (num_monomers, residues_per_monomer, 3)
+
+
+# computes and averages per-residue intermolecular contact frequencies between Cα atoms of monomer pairs (minimum distance)
+# that are part of the largest condensate in each of the last X frames, based on a specified distance threshold
+
+contact_matrix = np.zeros((residues_per_monomer, residues_per_monomer))
+pair_count = 0
+
+frame_indices = list(range(n_frames - num_frames_to_average, n_frames))
+
+for frame_offset, frame_index in enumerate(frame_indices):
+    u.trajectory[frame_index]
+
+    monomer_ca_coords = get_monomer_ca_positions(u, residues_per_monomer)
+    condensate_chains = condensate_chain_lists[frame_offset]
+
+    for i_idx in range(len(condensate_chains)):
+        for j_idx in range(i_idx + 1, len(condensate_chains)):
+            i = condensate_chains[i_idx]
+            j = condensate_chains[j_idx]
+
+            mon_a = monomer_ca_coords[i]
+            mon_b = monomer_ca_coords[j]
+
+            temp_contact = np.zeros((residues_per_monomer, residues_per_monomer))
+
+            contact_counter = 0 # initialise contact counter
+
+            # debugging 1: to check if the chains analysed have valid coordinates
+            print(f"Frame {frame_index}, chains: {condensate_chains}")
+            print(f"Comparing monomer {i} vs {j}")
+            print(f"Monomer A valid coords: {np.sum(~np.isnan(mon_a).any(axis=1))}")
+            print(f"Monomer B valid coords: {np.sum(~np.isnan(mon_b).any(axis=1))}")
+
+            for idx_a, ca_a in enumerate(mon_a): # residue loop
+                for idx_b, ca_b in enumerate(mon_b):
+                    if np.any(np.isnan(ca_a)) or np.any(np.isnan(ca_b)):
+                        continue
+
+                    dist = np.linalg.norm(ca_a - ca_b)
+                    if idx_a < 3 and idx_b < 3:  # debugging 2: are distances never lower than the contact threshold? units in Å or nm?
+                        print(f"res {idx_a} vs {idx_b}: dist = {dist:.2f} Å")
+                    if dist <= contact_threshold:
+                        contact_counter += 1
+
+                        if idx_a == idx_b:
+                            temp_contact[idx_a, idx_b] += 1
+                        else:
+                            temp_contact[idx_a, idx_b] += 1
+                            temp_contact[idx_b, idx_a] += 1
+
+            contact_matrix += temp_contact
+            pair_count += 1
+
+print(f"Total monomer pair comparisons: {pair_count}")
+print("Total contacts detected:", contact_counter)
+
+average_contact_matrix = contact_matrix / pair_count
+
+# check whats in the data
+print("Min:", np.min(average_contact_matrix))
+print("Max:", np.max(average_contact_matrix))
+print("Mean:", np.mean(average_contact_matrix))
+
+
+np.savetxt(
+    'experiment_2_YY1_1-270/average_contact_matrix_1-270.csv',
+    average_contact_matrix,
+    delimiter=','
+)
+# plotting, full construct, axes as residue number
+
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Load matrix from file
+average_contact_matrix = np.loadtxt(
+    'experiment_2_YY1_1-270/average_contact_matrix_1-270.csv',
+    delimiter=','
+)
+
+# Flip vertically so residue 101 is at bottom
+matrix_flipped = np.flipud(average_contact_matrix)
+
+# === Define residue numbering ===
+residue_start = 1
+residue_end = 270
+residue_numbers = list(range(residue_start, residue_end + 1))  # 101 to 270
+
+# Define tick locations (e.g., every 50 residues)
+tick_locs = np.arange(0, len(residue_numbers), 50)
+tick_labels = [str(residue_numbers[i]) for i in tick_locs]
+
+plt.figure(figsize=(10, 10))
+
+# Plot heatmap and assign to ax
+ax = sns.heatmap(
+    matrix_flipped,
+    cmap='Oranges',
+    square=True,
+    cbar_kws={
+        'label': 'Average Contact Frequency',
+        'shrink': 0.7
+    },
+    linewidths=0,
+    linecolor='none'
+)
+
+# === Fix tick positions ===
+# X-axis ticks (left to right, no flip needed)
+ax.set_xticks(tick_locs + 0.5)
+ax.set_xticklabels(tick_labels, fontsize=12, rotation=0)
+
+# Y-axis ticks (bottom to top, matrix is flipped)
+ax.set_yticks(tick_locs + 0.5)  # shift to align with cell edge
+ax.set_yticklabels(tick_labels[::-1], fontsize=12, rotation=0)  # reverse so 101 is at bottom
+
+# Axis labels
+plt.xlabel('YY1-N270', fontsize=14, fontweight='bold')
+plt.ylabel('YY1-N270', fontsize=14, fontweight='bold')
+
+# Colorbar formatting
+colorbar = ax.collections[0].colorbar
+colorbar.ax.tick_params(labelsize=12)
+colorbar.ax.set_ylabel('Average Contact Frequency', fontsize=14, fontweight='bold')
+
+plt.tight_layout()
+plt.savefig("plots/contact_heatmap_1-270_full_10A.png", dpi=300, bbox_inches='tight')
+plt.show()
+
+# run the full plot code first, asymmetric zoom
+
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# === ZOOMED-IN PLOT BLOCK START ===
+
+# Define ranges
+x_start, x_end = 35, 56   # 101-270 (168–188), 1-270 ()
+y_start, y_end = 199, 262    # 101-270 (108–150), 1-270 ()
+
+# Slice and flip Y-axis
+matrix_zoomed = average_contact_matrix[y_start:y_end, x_start:x_end]
+matrix_zoomed_flipped = np.flipud(matrix_zoomed)
+
+# Labels with correct residue numbers
+custom_x_numbers = list(range(36, 57))
+custom_y_numbers = list(range(200, 263))
+
+xticks_labels = [f"{aa}{res}" for aa, res in zip(amino_acids[x_start:x_end], custom_x_numbers)]
+yticks_labels = [f"{aa}{res}" for aa, res in zip(amino_acids[y_start:y_end], custom_y_numbers)][::-1]
+
+plt.figure(figsize=(15, 10))
+
+# Create heatmap and assign to ax
+ax = sns.heatmap(
+    matrix_zoomed_flipped,
+    cmap='Oranges',
+    square=True,
+    cbar_kws={'label': 'Average Contact Frequency'},
+    xticklabels=xticks_labels,
+    yticklabels=yticks_labels,
+    linewidths=0,
+    linecolor='none'
+)
+
+# Set tick formatting
+plt.xticks(np.arange(len(xticks_labels)), xticks_labels, fontsize=12, rotation=90)
+plt.yticks(np.arange(len(yticks_labels)), yticks_labels, fontsize=12, rotation=0)
+
+# Axis labels
+plt.xlabel('Residue 36–56', fontsize=14, fontweight='bold')
+plt.ylabel('Residue 200–262', fontsize=14, fontweight='bold')
+
+# Access colorbar and format its label and tick sizes
+colorbar = ax.collections[0].colorbar
+colorbar.ax.set_ylabel('Average Contact Frequency', fontsize=14, fontweight='bold')
+colorbar.ax.tick_params(labelsize=12)
+
+plt.tight_layout()
+plt.savefig("plots/contact_heatmap_1-270_zoomed_10A_no1.png", dpi=300, bbox_inches='tight')
+plt.show()
